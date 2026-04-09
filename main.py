@@ -8,11 +8,23 @@ import joblib
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from FlightRadar24.api import FlightRadar24API
 
-# ─────────────────────────────────────────────
-#  LIFESPAN — carga el modelo una sola vez
-# ─────────────────────────────────────────────
+# Diagnóstico de FlightRadar24
+try:
+    from FlightRadar24.api import FlightRadar24API
+    print("✅ Import FlightRadar24.api OK")
+except ImportError:
+    try:
+        from flightradar24.api import Api as FlightRadar24API
+        print("✅ Import flightradar24.api OK")
+    except ImportError:
+        try:
+            import FlightRadar24
+            print(f"✅ FlightRadar24 encontrado, dir: {dir(FlightRadar24)}")
+            FlightRadar24API = None
+        except ImportError as e:
+            print(f"❌ FlightRadar24 no encontrado: {e}")
+            FlightRadar24API = None
 MODEL = None
 
 @asynccontextmanager
