@@ -8,7 +8,7 @@ import joblib
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from FlightRadar24 import FlightRadar24API
+from FlightRadar24.api import FlightRadar24API
 
 # ─────────────────────────────────────────────
 #  LIFESPAN — carga el modelo una sola vez
