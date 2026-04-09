@@ -6,25 +6,9 @@ import requests
 import joblib
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-
-# Import FlightRadar24 con fallback
-try:
-    from flightradar24.api import Api as FlightRadar24API
-    FR24_MODE = "flightradar24"
-    print("✅ Import flightradar24.api OK")
-except ImportError:
-    try:
-        from FlightRadar24.api import FlightRadar24API
-        FR24_MODE = "FlightRadar24"
-        print("✅ Import FlightRadar24.api OK")
-    except ImportError:
-        FlightRadar24API = None
-        FR24_MODE = "none"
-        print("❌ FlightRadar24 no disponible")
 
 # ─────────────────────────────────────────────
-#  LIFESPAN — carga el modelo una sola vez
+#  LIFESPAN
 # ─────────────────────────────────────────────
 MODEL = None
 
@@ -43,7 +27,6 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────
 app = FastAPI(
     title="SkyOps AI — API",
-    description="Backend para el panel de operaciones de vuelos USA con predicción IA",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -62,9 +45,79 @@ app.add_middleware(
 AIRPORTS = {
     "ATL": {"name": "Atlanta Hartsfield-Jackson", "coords": [33.6407, -84.4277], "icao": "KATL"},
     "ORD": {"name": "Chicago O'Hare",             "coords": [41.9742, -87.9073], "icao": "KORD"},
-    "LAX": {"name": "Los Angeles International",  "coords": [33.9416, -118.4085],"icao": "KLAX"},
+    "LAX": {"name": "Los Angeles International",  "coords": [33.9416, -118.4085], "icao": "KLAX"},
     "JFK": {"name": "New York JFK",               "coords": [40.6413, -73.7781], "icao": "KJFK"},
 }
+
+FR24_BASE = "https://data-live.flightradar24.com"
+FR24_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+}
+
+# ─────────────────────────────────────────────
+#  FLIGHTRADAR24 — llamadas directas HTTP
+# ─────────────────────────────────────────────
+def fr24_get_flights_in_area(lat1, lon1, lat2, lon2) -> list:
+    """Obtiene vuelos en un bounding box."""
+    try:
+        url = f"{FR24_BASE}/zones/fcgi/feed.js"
+        params = {
+            "faa": 1, "satellite": 1, "mlat": 1, "flarm": 1, "adsb": 1,
+            "gnd": 0, "air": 1, "vehicles": 0, "estimated": 0,
+            "maxage": 14400, "gliders": 0, "stats": 0,
+            "bounds": f"{lat1},{lat2},{lon1},{lon2}",
+        }
+        r = requests.get(url, params=params, headers=FR24_HEADERS, timeout=15)
+        if r.status_code != 200:
+            print(f"⚠️  FR24 feed status: {r.status_code}")
+            return []
+        data = r.json()
+        flights = []
+        for key, val in data.items():
+            if key in ("full_count", "version", "stats") or not isinstance(val, list):
+                continue
+            if len(val) < 13:
+                continue
+            flights.append({
+                "id":           key,
+                "callsign":     val[16] if len(val) > 16 else "N/A",
+                "latitude":     val[1],
+                "longitude":    val[2],
+                "heading":      val[3],
+                "altitude":     val[4],
+                "speed":        val[5],
+                "aircraft":     val[8]  if len(val) > 8  else "N/A",
+                "registration": val[9]  if len(val) > 9  else "N/A",
+                "origin":       val[11] if len(val) > 11 else "N/A",
+                "destination":  val[12] if len(val) > 12 else "N/A",
+                "airline_iata": val[13] if len(val) > 13 else "N/A",
+                "vertical_speed": val[15] if len(val) > 15 else 0,
+            })
+        return flights
+    except Exception as e:
+        print(f"⚠️  FR24 feed error: {e}")
+        return []
+
+
+def fr24_get_airport_schedule(iata: str) -> dict:
+    """Obtiene llegadas y salidas programadas de un aeropuerto."""
+    try:
+        url = f"https://api.flightradar24.com/common/v1/airport.json"
+        params = {
+            "code": iata,
+            "plugin[]": ["schedule"],
+            "plugin-setting[schedule][mode]": "arrivals",
+            "limit": 100,
+        }
+        r = requests.get(url, params=params, headers=FR24_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return {}
+        return r.json()
+    except Exception as e:
+        print(f"⚠️  FR24 airport error {iata}: {e}")
+        return {}
+
 
 # ─────────────────────────────────────────────
 #  HELPERS
@@ -96,13 +149,13 @@ def fetch_weather(iatas: list) -> dict:
             times = r["hourly"]["time"]
             result[apt] = {
                 t: {
-                    "wind":       r["hourly"]["wind_speed_10m"][i]      or 0,
-                    "gusts":      r["hourly"]["wind_gusts_10m"][i]      or 0,
-                    "direction":  r["hourly"]["wind_direction_10m"][i]  or 0,
-                    "visibility": r["hourly"]["visibility"][i]          or 10000,
-                    "clouds":     r["hourly"]["cloudcover"][i]          or 0,
-                    "temp":       r["hourly"]["temperature_2m"][i]      or 15,
-                    "precip":     r["hourly"]["precipitation"][i]       or 0,
+                    "wind":       r["hourly"]["wind_speed_10m"][i]     or 0,
+                    "gusts":      r["hourly"]["wind_gusts_10m"][i]     or 0,
+                    "direction":  r["hourly"]["wind_direction_10m"][i] or 0,
+                    "visibility": r["hourly"]["visibility"][i]         or 10000,
+                    "clouds":     r["hourly"]["cloudcover"][i]         or 0,
+                    "temp":       r["hourly"]["temperature_2m"][i]     or 15,
+                    "precip":     r["hourly"]["precipitation"][i]      or 0,
                 }
                 for i, t in enumerate(times)
             }
@@ -112,28 +165,25 @@ def fetch_weather(iatas: list) -> dict:
     return result
 
 
-def get_weather_at(iata: str, dt: datetime, weather_cache: dict) -> dict:
-    fallback = {"wind": 0, "gusts": 0, "direction": 0, "visibility": 10000,
-                "clouds": 0, "temp": 15, "precip": 0}
-    if iata not in weather_cache:
+def get_weather_at(iata: str, dt: datetime, cache: dict) -> dict:
+    fallback = {"wind": 0, "gusts": 0, "direction": 0,
+                "visibility": 10000, "clouds": 0, "temp": 15, "precip": 0}
+    if iata not in cache:
         return fallback
     key = dt.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00")
-    return weather_cache[iata].get(key, fallback)
+    return cache[iata].get(key, fallback)
 
 
-def predict_risk(origin: str, dest: str, carrier_iata: str,
-                 eta: datetime, weather_cache: dict) -> dict:
+def predict_risk(origin, dest, carrier_iata, eta, weather_cache) -> dict:
     if MODEL is None:
         return {"score": 0.0, "level": "LOW", "label": "Baja",
                 "pct": "0%", "windAtDest": 0, "precipAtDest": 0}
-
     c_orig = get_weather_at(origin, eta, weather_cache)
     c_dest = get_weather_at(dest,   eta, weather_cache)
-
     try:
-        enc_orig = MODEL["le_orig"].transform([origin])[0]         if origin       in MODEL["le_orig"].classes_    else 0
-        enc_dest = MODEL["le_dest"].transform([dest])[0]           if dest         in MODEL["le_dest"].classes_    else 0
-        enc_carr = MODEL["le_carrier"].transform([carrier_iata])[0] if carrier_iata in MODEL["le_carrier"].classes_ else 0
+        enc_orig = MODEL["le_orig"].transform([origin])[0]          if origin        in MODEL["le_orig"].classes_    else 0
+        enc_dest = MODEL["le_dest"].transform([dest])[0]            if dest          in MODEL["le_dest"].classes_    else 0
+        enc_carr = MODEL["le_carrier"].transform([carrier_iata])[0] if carrier_iata  in MODEL["le_carrier"].classes_ else 0
     except Exception:
         enc_orig = enc_dest = enc_carr = 0
 
@@ -144,19 +194,13 @@ def predict_risk(origin: str, dest: str, carrier_iata: str,
     ]], columns=MODEL["features"])
 
     prob = float(MODEL["modelo"].predict_proba(features)[0][1])
-
-    if prob < 0.25:
-        level, label = "LOW",    "Baja"
-    elif prob < 0.60:
-        level, label = "MEDIUM", "Media"
-    else:
-        level, label = "HIGH",   "Alta"
+    if prob < 0.25:   level, label = "LOW",    "Baja"
+    elif prob < 0.60: level, label = "MEDIUM", "Media"
+    else:             level, label = "HIGH",   "Alta"
 
     return {
-        "score":        round(prob, 4),
-        "level":        level,
-        "label":        label,
-        "pct":          f"{prob:.1%}",
+        "score": round(prob, 4), "level": level, "label": label,
+        "pct": f"{prob:.1%}",
         "windAtDest":   round(c_dest["wind"],   1),
         "precipAtDest": round(c_dest["precip"], 2),
     }
@@ -171,48 +215,6 @@ def safe_iata(node) -> str:
     return "N/A"
 
 
-def safe_str(val, fallback="N/A") -> str:
-    return str(val) if val is not None else fallback
-
-
-def get_fr_client():
-    if FlightRadar24API is None:
-        return None
-    try:
-        return FlightRadar24API()
-    except Exception as e:
-        print(f"⚠️  Error creando cliente FR24: {e}")
-        return None
-
-
-def fr_get_flights(fr):
-    """Obtiene vuelos en aire con compatibilidad entre versiones."""
-    try:
-        # versión 0.3.1 (flightradar24 minúsculas)
-        if FR24_MODE == "flightradar24":
-            return fr.get_flights()
-        # versión antigua (FlightRadar24 mayúsculas)
-        return fr.get_flights()
-    except Exception as e:
-        print(f"⚠️  get_flights error: {e}")
-        return []
-
-
-def fr_get_airport(fr, iata: str):
-    """Obtiene schedule de llegadas/salidas con compatibilidad entre versiones."""
-    try:
-        if FR24_MODE == "flightradar24":
-            # En 0.3.1 puede ser get_airport() o get_airport_details()
-            try:
-                return fr.get_airport_details(iata)
-            except AttributeError:
-                return fr.get_airport(iata)
-        return fr.get_airport_details(iata)
-    except Exception as e:
-        print(f"⚠️  get_airport error {iata}: {e}")
-        return None
-
-
 # ─────────────────────────────────────────────
 #  ENDPOINTS
 # ─────────────────────────────────────────────
@@ -224,7 +226,6 @@ def root():
         "service": "SkyOps AI API",
         "version": "1.0.0",
         "model_loaded": MODEL is not None,
-        "fr24_mode": FR24_MODE,
     }
 
 
@@ -233,8 +234,6 @@ def health():
     return {
         "status": "ok",
         "model_loaded": MODEL is not None,
-        "fr24_available": FlightRadar24API is not None,
-        "fr24_mode": FR24_MODE,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -246,7 +245,7 @@ def get_airports():
 
 @app.get("/flights")
 def get_flights(
-    airport: str = Query(default="ALL", description="IATA code o ALL"),
+    airport: str = Query(default="ALL"),
     hours:   int = Query(default=15, ge=1, le=24),
 ):
     iatas = list(AIRPORTS.keys()) if airport == "ALL" else [airport.upper()]
@@ -256,171 +255,154 @@ def get_flights(
 
     now   = datetime.now(timezone.utc)
     limit = now + timedelta(hours=hours)
-
     weather = fetch_weather(iatas)
 
-    fr = get_fr_client()
-    in_air_raw, arrivals_raw, departures_raw = [], [], []
-
-    if fr is not None:
-        # Vuelos en aire
-        try:
-            all_flights = fr_get_flights(fr)
-            for f in all_flights:
-                spd = getattr(f, "ground_speed", 0) or 0
-                if spd > 0:
-                    dest = safe_str(getattr(f, "destination_airport_iata", "")).upper()
-                    if dest in iatas:
-                        in_air_raw.append(f)
-                    else:
-                        for apt in iatas:
-                            dist = haversine_nm(
-                                f.latitude, f.longitude,
-                                AIRPORTS[apt]["coords"][0], AIRPORTS[apt]["coords"][1],
-                            )
-                            if dist < 500:
-                                in_air_raw.append(f)
-                                break
-        except Exception as e:
-            print(f"⚠️  inAir error: {e}")
-
-        # Schedules
-        for apt in iatas:
-            try:
-                details = fr_get_airport(fr, apt)
-                if details:
-                    arr = details["airport"]["pluginData"]["schedule"]["arrivals"]["data"]
-                    dep = details["airport"]["pluginData"]["schedule"]["departures"]["data"]
-                    for v in arr: v["_target"] = apt
-                    for v in dep: v["_target"] = apt
-                    arrivals_raw.extend(arr)
-                    departures_raw.extend(dep)
-            except Exception as e:
-                print(f"⚠️  schedule error {apt}: {e}")
-
-    # ── Serializar vuelos en aire ───────────────
+    # ── Vuelos en aire ──────────────────────────
     in_air_out = []
-    for f in in_air_raw:
-        dest         = safe_str(getattr(f, "destination_airport_iata", "N/A")).upper()
-        origin       = safe_str(getattr(f, "origin_airport_iata",      "N/A")).upper()
-        carrier_iata = safe_str(getattr(f, "airline_iata", "N/A"))
-        speed        = max(getattr(f, "ground_speed", 1) or 1, 1)
+    seen_ids   = set()
 
-        if dest in AIRPORTS:
-            dist_nm = haversine_nm(
-                f.latitude, f.longitude,
-                AIRPORTS[dest]["coords"][0], AIRPORTS[dest]["coords"][1],
-            )
-            eta_dt = now + timedelta(hours=dist_nm / speed)
-        else:
-            eta_dt = now + timedelta(hours=2)
-
-        risk = predict_risk(origin, dest, carrier_iata, eta_dt, weather)
-
-        in_air_out.append({
-            "id":            safe_str(getattr(f, "id", "")),
-            "callsign":      safe_str(getattr(f, "callsign",           "N/A")),
-            "airline":       safe_str(getattr(f, "airline_short_name", "N/A")),
-            "aircraft":      safe_str(getattr(f, "aircraft_code",      "N/A")),
-            "registration":  safe_str(getattr(f, "registration",       "N/A")),
-            "origin":        origin,
-            "destination":   dest,
-            "latitude":      round(float(f.latitude),  4),
-            "longitude":     round(float(f.longitude), 4),
-            "altitude":      getattr(f, "altitude",       0) or 0,
-            "speed":         getattr(f, "ground_speed",   0) or 0,
-            "heading":       getattr(f, "heading",        0) or 0,
-            "verticalSpeed": getattr(f, "vertical_speed", 0) or 0,
-            "eta":           eta_dt.isoformat(),
-            "scheduledTime": eta_dt.isoformat(),
-            "estimatedTime": eta_dt.isoformat(),
-            "riskLevel":     risk["level"],
-            "riskScore":     risk["score"],
-            "riskLabel":     risk["label"],
-            "windAtDest":    risk.get("windAtDest",   0),
-            "precipAtDest":  risk.get("precipAtDest", 0),
-        })
-
-    # ── Serializar llegadas / salidas ───────────
-    def serialize_schedule(raw_list: list, mode: str) -> list:
-        out = []
-        for v in raw_list:
-            fdata   = v.get("flight") or {}
-            ts_key  = "arrival" if mode == "arrival" else "departure"
-            t_node  = fdata.get("time") or {}
-            ts_sched = (t_node.get("scheduled") or {}).get(ts_key)
-            ts_est   = (t_node.get("estimated") or {}).get(ts_key) or \
-                       (t_node.get("real")      or {}).get(ts_key) or ts_sched
-
-            if not ts_sched:
+    for apt in iatas:
+        lat, lon = AIRPORTS[apt]["coords"]
+        # Bounding box ~500nm alrededor del aeropuerto
+        raw_flights = fr24_get_flights_in_area(
+            lat + 7, lon - 10, lat - 7, lon + 10
+        )
+        for f in raw_flights:
+            fid = f["id"]
+            if fid in seen_ids:
                 continue
+            seen_ids.add(fid)
 
-            sched_dt = datetime.fromtimestamp(ts_sched, tz=timezone.utc)
-            if not (now <= sched_dt <= limit):
-                continue
+            dest   = str(f.get("destination", "N/A")).upper()
+            origin = str(f.get("origin",      "N/A")).upper()
+            speed  = max(f.get("speed", 1) or 1, 1)
+            carrier_iata = str(f.get("airline_iata", "N/A"))
 
-            est_dt = datetime.fromtimestamp(ts_est, tz=timezone.utc) if ts_est else sched_dt
+            if dest in AIRPORTS:
+                d_lat, d_lon = AIRPORTS[dest]["coords"]
+            else:
+                d_lat, d_lon = AIRPORTS[apt]["coords"]
 
-            apt_data   = fdata.get("airport") or {}
-            origin_nd  = apt_data.get("origin")      or {}
-            dest_nd    = apt_data.get("destination")  or {}
-            origin     = safe_iata(origin_nd)
-            destination= safe_iata(dest_nd)
-            target     = v.get("_target", "N/A")
+            dist_nm = haversine_nm(f["latitude"], f["longitude"], d_lat, d_lon)
+            eta_dt  = now + timedelta(hours=dist_nm / speed)
+            risk    = predict_risk(origin, dest, carrier_iata, eta_dt, weather)
 
-            al_data      = fdata.get("airline") or {}
-            airline_name = al_data.get("name", "N/A")
-            carrier_iata = (al_data.get("code") or {}).get("iata", "N/A")
-            ac_data      = fdata.get("aircraft") or {}
-            aircraft_code= (ac_data.get("model") or {}).get("code", "N/A")
-            registration = ac_data.get("registration", "N/A")
-            num_data     = (fdata.get("identification") or {}).get("number") or {}
-            callsign     = num_data.get("default", "N/A")
-
-            o = origin if mode == "arrival" else target
-            d = target if mode == "arrival" else destination
-
-            risk = predict_risk(o, d, carrier_iata, sched_dt, weather)
-
-            out.append({
-                "id":            callsign + str(ts_sched),
-                "callsign":      callsign,
-                "airline":       airline_name,
-                "aircraft":      aircraft_code,
-                "registration":  registration,
-                "origin":        o,
-                "destination":   d,
-                "latitude":      0,
-                "longitude":     0,
-                "altitude":      0,
-                "speed":         0,
-                "heading":       0,
-                "verticalSpeed": 0,
-                "eta":           est_dt.isoformat(),
-                "scheduledTime": sched_dt.isoformat(),
-                "estimatedTime": est_dt.isoformat(),
+            in_air_out.append({
+                "id":            fid,
+                "callsign":      f.get("callsign",     "N/A"),
+                "airline":       f.get("airline_iata", "N/A"),
+                "aircraft":      f.get("aircraft",     "N/A"),
+                "registration":  f.get("registration", "N/A"),
+                "origin":        origin,
+                "destination":   dest,
+                "latitude":      round(float(f["latitude"]),  4),
+                "longitude":     round(float(f["longitude"]), 4),
+                "altitude":      f.get("altitude",       0) or 0,
+                "speed":         f.get("speed",          0) or 0,
+                "heading":       f.get("heading",        0) or 0,
+                "verticalSpeed": f.get("vertical_speed", 0) or 0,
+                "eta":           eta_dt.isoformat(),
+                "scheduledTime": eta_dt.isoformat(),
+                "estimatedTime": eta_dt.isoformat(),
                 "riskLevel":     risk["level"],
                 "riskScore":     risk["score"],
                 "riskLabel":     risk["label"],
-                "windAtDest":    risk.get("windAtDest",   0),
-                "precipAtDest":  risk.get("precipAtDest", 0),
+                "windAtDest":    risk["windAtDest"],
+                "precipAtDest":  risk["precipAtDest"],
             })
-        return out
 
-    arrivals   = serialize_schedule(arrivals_raw,   "arrival")
-    departures = serialize_schedule(departures_raw, "departure")
+    # ── Schedules (llegadas + salidas) ──────────
+    arrivals_out   = []
+    departures_out = []
+
+    for apt in iatas:
+        data = fr24_get_airport_schedule(apt)
+        try:
+            arr_list = data["result"]["response"]["airport"]["pluginData"]["schedule"]["arrivals"]["data"]
+        except (KeyError, TypeError):
+            arr_list = []
+        try:
+            dep_list = data["result"]["response"]["airport"]["pluginData"]["schedule"]["departures"]["data"]
+        except (KeyError, TypeError):
+            dep_list = []
+
+        def parse_flight(v, mode):
+            try:
+                fdata = v.get("flight") or {}
+                ts_key = "arrival" if mode == "arrival" else "departure"
+                t_node = fdata.get("time") or {}
+                ts_sched = (t_node.get("scheduled") or {}).get(ts_key)
+                ts_est   = (t_node.get("estimated") or {}).get(ts_key) or \
+                           (t_node.get("real")      or {}).get(ts_key) or ts_sched
+                if not ts_sched:
+                    return None
+                sched_dt = datetime.fromtimestamp(ts_sched, tz=timezone.utc)
+                if not (now <= sched_dt <= limit):
+                    return None
+                est_dt = datetime.fromtimestamp(ts_est, tz=timezone.utc) if ts_est else sched_dt
+
+                apt_data    = fdata.get("airport") or {}
+                origin_nd   = apt_data.get("origin")      or {}
+                dest_nd     = apt_data.get("destination") or {}
+                origin      = safe_iata(origin_nd)
+                destination = safe_iata(dest_nd)
+
+                al_data      = fdata.get("airline") or {}
+                airline_name = al_data.get("name", "N/A")
+                carrier_iata = (al_data.get("code") or {}).get("iata", "N/A")
+                ac_data      = fdata.get("aircraft") or {}
+                aircraft_code= (ac_data.get("model") or {}).get("code", "N/A")
+                registration = ac_data.get("registration", "N/A")
+                num_data     = (fdata.get("identification") or {}).get("number") or {}
+                callsign     = num_data.get("default", "N/A")
+
+                o = origin if mode == "arrival" else apt
+                d = apt    if mode == "arrival" else destination
+
+                risk = predict_risk(o, d, carrier_iata, sched_dt, weather)
+                return {
+                    "id":            callsign + str(ts_sched),
+                    "callsign":      callsign,
+                    "airline":       airline_name,
+                    "aircraft":      aircraft_code,
+                    "registration":  registration,
+                    "origin":        o,
+                    "destination":   d,
+                    "latitude":      0, "longitude": 0,
+                    "altitude":      0, "speed": 0, "heading": 0, "verticalSpeed": 0,
+                    "eta":           est_dt.isoformat(),
+                    "scheduledTime": sched_dt.isoformat(),
+                    "estimatedTime": est_dt.isoformat(),
+                    "riskLevel":     risk["level"],
+                    "riskScore":     risk["score"],
+                    "riskLabel":     risk["label"],
+                    "windAtDest":    risk["windAtDest"],
+                    "precipAtDest":  risk["precipAtDest"],
+                }
+            except Exception as e:
+                print(f"⚠️  parse_flight error: {e}")
+                return None
+
+        for v in arr_list:
+            f = parse_flight(v, "arrival")
+            if f:
+                arrivals_out.append(f)
+        for v in dep_list:
+            f = parse_flight(v, "departure")
+            if f:
+                departures_out.append(f)
 
     return {
         "airport":    airport,
         "hours":      hours,
         "timestamp":  now.isoformat(),
         "inAir":      in_air_out,
-        "arrivals":   arrivals,
-        "departures": departures,
+        "arrivals":   arrivals_out,
+        "departures": departures_out,
         "counts": {
             "inAir":      len(in_air_out),
-            "arrivals":   len(arrivals),
-            "departures": len(departures),
+            "arrivals":   len(arrivals_out),
+            "departures": len(departures_out),
         },
     }
 
@@ -430,15 +412,9 @@ def get_weather(iata: str):
     iata = iata.upper()
     if iata not in AIRPORTS:
         raise HTTPException(400, f"Aeropuerto desconocido: {iata}")
-
-    weather    = fetch_weather([iata])
+    weather     = fetch_weather([iata])
     apt_weather = weather.get(iata, {})
-
-    result = [
-        {"hour": hour_str + ":00", **data}
-        for hour_str, data in apt_weather.items()
-    ]
-
+    result = [{"hour": k + ":00", **v} for k, v in apt_weather.items()]
     return {
         "airport":   iata,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -451,47 +427,19 @@ def get_metar_taf(iata: str):
     iata = iata.upper()
     if iata not in AIRPORTS:
         raise HTTPException(400, f"Aeropuerto desconocido: {iata}")
-
     icao = AIRPORTS[iata]["icao"]
-    metar_text = taf_text = ""
-
     try:
-        r = requests.get(
-            f"https://aviationweather.gov/api/data/metar?ids={icao}&format=raw",
-            timeout=8,
-        )
-        metar_text = r.text.strip() if r.status_code == 200 else f"No hay METAR para {icao}"
+        r = requests.get(f"https://aviationweather.gov/api/data/metar?ids={icao}&format=raw", timeout=8)
+        metar = r.text.strip() if r.status_code == 200 else f"No hay METAR para {icao}"
     except Exception:
-        metar_text = f"Error obteniendo METAR para {icao}"
-
+        metar = f"Error obteniendo METAR para {icao}"
     try:
-        r = requests.get(
-            f"https://aviationweather.gov/api/data/taf?ids={icao}&format=raw",
-            timeout=8,
-        )
-        taf_text = r.text.strip() if r.status_code == 200 else f"No hay TAF para {icao}"
+        r = requests.get(f"https://aviationweather.gov/api/data/taf?ids={icao}&format=raw", timeout=8)
+        taf = r.text.strip() if r.status_code == 200 else f"No hay TAF para {icao}"
     except Exception:
-        taf_text = f"Error obteniendo TAF para {icao}"
-
+        taf = f"Error obteniendo TAF para {icao}"
     return {
-        "airport":   iata,
-        "icao":      icao,
-        "metar":     metar_text,
-        "taf":       taf_text,
+        "airport": iata, "icao": icao,
+        "metar": metar, "taf": taf,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
-
-@app.get("/airlines")
-def get_airlines():
-    fr = get_fr_client()
-    if fr is None:
-        raise HTTPException(503, "FlightRadar24 no disponible")
-    try:
-        airlines = fr.get_airlines()
-        return [
-            {"icao": a.get("ICAO", ""), "iata": a.get("Code", ""), "name": a["Name"]}
-            for a in airlines if "Name" in a
-        ]
-    except Exception as e:
-        raise HTTPException(500, f"Error obteniendo aerolíneas: {e}")
