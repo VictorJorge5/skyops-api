@@ -196,18 +196,10 @@ def get_flights(
         all_flights = fr.get_flights()
         for f in all_flights:
             if getattr(f, "ground_speed", 0) > 0:
-                dest = safe_str(getattr(f, "destination_airport_iata", "")).upper()
-                if dest in iatas:
-                    in_air_raw.append(f)
-                else:
-                    for apt in iatas:
-                        dist = haversine_nm(
-                            f.latitude, f.longitude,
-                            AIRPORTS[apt]["coords"][0], AIRPORTS[apt]["coords"][1],
-                        )
-                        if dist < 500:
-                            in_air_raw.append(f)
-                            break
+        dest   = safe_str(getattr(f, "destination_airport_iata", "")).upper()
+        origin = safe_str(getattr(f, "origin_airport_iata", "")).upper()
+        if dest in iatas or origin in iatas:
+            in_air_raw.append(f)
     except Exception as e:
         print(f"⚠️  get_flights error: {e}")
 
